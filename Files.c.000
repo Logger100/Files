@@ -1,0 +1,1200 @@
+/*
+ * G1FM - GIII File Manager
+ *
+ * Target:
+ *   Casio fx-9750GIII
+ *
+ * Build:
+ *   Old Casio fx-9860G SDK
+ *
+ * Storage:
+ *   INTERNAL STORAGE ONLY
+ *
+ * Features:
+ *   - Browse folders
+ *   - Open folders
+ *   - Parent directory
+ *   - View text files
+ *   - File information
+ *   - Delete files
+ *   - Delete empty folders
+ *   - Create folders
+ *   - Free storage display
+ *
+ * C89 compatible.
+ */
+
+
+#include "fxlib.h"
+#include "filebios.h"
+
+#include <string.h>
+
+/* -------------------------------------------------- */
+/* Configuration                                      */
+/* -------------------------------------------------- */
+
+#define MAX_ITEMS       64
+#define NAME_SIZE       21
+#define PATH_SIZE       128
+
+#define LIST_TOP        18
+#define ROW_HEIGHT      9
+#define VISIBLE_ROWS    4
+
+#define TYPE_FILE       0
+#define TYPE_DIRECTORY  1
+
+/* -------------------------------------------------- */
+/* File entry                                         */
+/* -------------------------------------------------- */
+
+typedef struct
+{
+    char name[NAME_SIZE];
+    unsigned long size;
+    unsigned short type;
+}
+FM_ENTRY;
+
+/* -------------------------------------------------- */
+/* Globals                                            */
+/* -------------------------------------------------- */
+
+static FM_ENTRY entries[MAX_ITEMS];
+
+static int entry_count = 0;
+static int selected = 0;
+static int first_visible = 0;
+
+static char current_path[PATH_SIZE] = "\\\\fls0";
+
+/* -------------------------------------------------- */
+/* FONTCHARACTER conversion                           */
+/* -------------------------------------------------- */
+
+static void ascii_to_font(
+    const char *src,
+    FONTCHARACTER *dst
+)
+{
+    int i;
+
+    i = 0;
+
+    while (src[i] != 0)
+    {
+        dst[i] = (FONTCHARACTER)src[i];
+        i++;
+    }
+
+    dst[i] = 0;
+}
+
+static void font_to_ascii(
+    const FONTCHARACTER *src,
+    char *dst,
+    int max
+)
+{
+    int i;
+
+    i = 0;
+
+    while (src[i] != 0 && i < max - 1)
+    {
+        if ((unsigned short)src[i] < 128)
+            dst[i] = (char)src[i];
+        else
+            dst[i] = '?';
+
+        i++;
+    }
+
+    dst[i] = 0;
+}
+
+/* -------------------------------------------------- */
+/* Path handling                                      */
+/* -------------------------------------------------- */
+
+static void make_path(
+    const char *name,
+    char *out
+)
+{
+    strcpy(out, current_path);
+
+    if (out[strlen(out) - 1] != '\\')
+        strcat(out, "\\");
+
+    strcat(out, name);
+}
+
+static void make_search_path(
+    FONTCHARACTER *out
+)
+{
+    char temp[PATH_SIZE];
+
+    strcpy(temp, current_path);
+    strcat(temp, "\\*");
+
+    ascii_to_font(temp, out);
+}
+
+/* -------------------------------------------------- */
+/* Clear screen                                       */
+/* -------------------------------------------------- */
+
+static void clear_screen(void)
+{
+    Bdisp_AllClr_DDVRAM();
+}
+
+/* -------------------------------------------------- */
+/* Wait for EXE/EXIT                                  */
+/* -------------------------------------------------- */
+
+static void wait_key(void)
+{
+    unsigned int key;
+
+    while (1)
+    {
+        GetKey(&key);
+
+        if (key == KEY_CTRL_EXE ||
+            key == KEY_CTRL_EXIT)
+            return;
+    }
+}
+
+/* -------------------------------------------------- */
+/* Message box                                        */
+/* -------------------------------------------------- */
+
+static void message(
+    const char *title,
+    const char *text
+)
+{
+    clear_screen();
+
+    PrintXY(1, 1, title, 0);
+
+    Bdisp_DrawLineVRAM(
+        0, 9,
+        127, 9
+    );
+
+    PrintXY(1, 20, text, 0);
+
+    PrintXY(
+        1,
+        55,
+        "EXE / EXIT",
+        0
+    );
+
+    Bdisp_PutDisp_DD();
+
+    wait_key();
+}
+
+/* -------------------------------------------------- */
+/* Load current directory                             */
+/* -------------------------------------------------- */
+
+static int load_directory(void)
+{
+    FONTCHARACTER search[PATH_SIZE];
+    FONTCHARACTER found[NAME_SIZE];
+
+    FILE_INFO info;
+
+    int handle;
+    int result;
+
+    entry_count = 0;
+    selected = 0;
+    first_visible = 0;
+
+    make_search_path(search);
+
+    result = Bfile_FindFirst(
+        search,
+        &handle,
+        found,
+        &info
+    );
+
+    if (result < 0)
+        return result;
+
+    while (result == 0 &&
+           entry_count < MAX_ITEMS)
+    {
+        font_to_ascii(
+            found,
+            entries[entry_count].name,
+            NAME_SIZE
+        );
+
+        entries[entry_count].size =
+            info.fsize;
+
+        if (info.type == DT_DIRECTORY)
+            entries[entry_count].type =
+                TYPE_DIRECTORY;
+        else
+            entries[entry_count].type =
+                TYPE_FILE;
+
+        entry_count++;
+
+        result = Bfile_FindNext(
+            handle,
+            found,
+            &info
+        );
+    }
+
+    Bfile_FindClose(handle);
+
+    return 0;
+}
+
+/* -------------------------------------------------- */
+/* Draw header                                        */
+/* -------------------------------------------------- */
+
+static void draw_header(void)
+{
+    char path[22];
+
+    clear_screen();
+
+    PrintXY(
+        1,
+        1,
+        "G1FM FILE MANAGER",
+        0
+    );
+
+    /*
+     * Display the end of the path.
+     */
+
+    if (strlen(current_path) > 20)
+    {
+        strcpy(
+            path,
+            current_path +
+            strlen(current_path) - 20
+        );
+    }
+    else
+    {
+        strcpy(path, current_path);
+    }
+
+    PrintXY(
+        1,
+        9,
+        path,
+        0
+    );
+
+    Bdisp_DrawLineVRAM(
+        0,
+        16,
+        127,
+        16
+    );
+}
+
+/* -------------------------------------------------- */
+/* Draw one entry                                     */
+/* -------------------------------------------------- */
+
+static void draw_entry(
+    int index,
+    int row
+)
+{
+    char line[23];
+    char name[18];
+
+    int y;
+
+    y = LIST_TOP +
+        row * ROW_HEIGHT;
+
+    if (index == selected)
+    {
+        Bdisp_AreaReverseVRAM(
+            0,
+            y - 1,
+            127,
+            y + 7
+        );
+    }
+
+    strcpy(name, entries[index].name);
+
+    /*
+     * Keep enough room for the icon.
+     */
+
+    name[17] = 0;
+
+    if (entries[index].type == TYPE_DIRECTORY)
+    {
+        strcpy(line, "[D] ");
+        strcat(line, name);
+    }
+    else
+    {
+        strcpy(line, "    ");
+        strcat(line, name);
+    }
+
+    line[21] = 0;
+
+    PrintXY(
+        1,
+        y,
+        line,
+        0
+    );
+}
+
+/* -------------------------------------------------- */
+/* Draw entire browser                                */
+/* -------------------------------------------------- */
+
+static void draw_browser(void)
+{
+    int i;
+    int index;
+
+    draw_header();
+
+    for (i = 0; i < VISIBLE_ROWS; i++)
+    {
+        index = first_visible + i;
+
+        if (index < entry_count)
+            draw_entry(index, i);
+    }
+
+    /*
+     * Bottom command bar.
+     */
+
+    PrintXY(
+        1,
+        55,
+        "EXE Open F1 Info F2 Del",
+        0
+    );
+
+    Bdisp_PutDisp_DD();
+}
+
+/* -------------------------------------------------- */
+/* Selection handling                                 */
+/* -------------------------------------------------- */
+
+static void move_up(void)
+{
+    if (entry_count == 0)
+        return;
+
+    selected--;
+
+    if (selected < 0)
+        selected = entry_count - 1;
+
+    if (selected < first_visible)
+        first_visible = selected;
+
+    if (selected >= first_visible +
+                    VISIBLE_ROWS)
+    {
+        first_visible =
+            selected - VISIBLE_ROWS + 1;
+    }
+}
+
+static void move_down(void)
+{
+    if (entry_count == 0)
+        return;
+
+    selected++;
+
+    if (selected >= entry_count)
+        selected = 0;
+
+    if (selected < first_visible)
+        first_visible = selected;
+
+    if (selected >= first_visible +
+                    VISIBLE_ROWS)
+    {
+        first_visible =
+            selected - VISIBLE_ROWS + 1;
+    }
+}
+
+/* -------------------------------------------------- */
+/* File information                                   */
+/* -------------------------------------------------- */
+
+static void show_info(void)
+{
+    FM_ENTRY *e;
+
+    char path[PATH_SIZE];
+    FONTCHARACTER fpath[PATH_SIZE];
+
+    int handle;
+    int size;
+
+    if (entry_count == 0)
+        return;
+
+    e = &entries[selected];
+
+    make_path(
+        e->name,
+        path
+    );
+
+    ascii_to_font(
+        path,
+        fpath
+    );
+
+    clear_screen();
+
+    PrintXY(
+        1,
+        1,
+        "FILE INFORMATION",
+        0
+    );
+
+    PrintXY(
+        1,
+        10,
+        e->name,
+        0
+    );
+
+    if (e->type == TYPE_DIRECTORY)
+    {
+        PrintXY(
+            1,
+            23,
+            "TYPE: DIRECTORY",
+            0
+        );
+    }
+    else
+    {
+        PrintXY(
+            1,
+            23,
+            "TYPE: FILE",
+            0
+        );
+
+        handle = Bfile_OpenFile(
+            fpath,
+            _OPENMODE_READ
+        );
+
+        if (handle >= 0)
+        {
+            size =
+                Bfile_GetFileSize(handle);
+
+            Bfile_CloseFile(handle);
+
+            PrintXY(
+                1,
+                32,
+                "SIZE:",
+                0
+            );
+
+            PrintMini(
+                38,
+                32,
+                size
+            );
+
+            PrintXY(
+                72,
+                32,
+                "BYTES",
+                0
+            );
+        }
+    }
+
+    PrintXY(
+        1,
+        43,
+        "EXE / EXIT = BACK",
+        0
+    );
+
+    Bdisp_PutDisp_DD();
+
+    wait_key();
+}
+
+/* -------------------------------------------------- */
+/* Delete item                                        */
+/* -------------------------------------------------- */
+
+static int confirm_delete(void)
+{
+    unsigned int key;
+
+    clear_screen();
+
+    PrintXY(
+        1,
+        5,
+        "DELETE ITEM?",
+        0
+    );
+
+    PrintXY(
+        1,
+        18,
+        entries[selected].name,
+        0
+    );
+
+    PrintXY(
+        1,
+        38,
+        "EXE = YES",
+        0
+    );
+
+    PrintXY(
+        1,
+        48,
+        "EXIT = NO",
+        0
+    );
+
+    Bdisp_PutDisp_DD();
+
+    while (1)
+    {
+        GetKey(&key);
+
+        if (key == KEY_CTRL_EXE)
+            return 1;
+
+        if (key == KEY_CTRL_EXIT)
+            return 0;
+    }
+}
+
+static void delete_selected(void)
+{
+    char path[PATH_SIZE];
+    FONTCHARACTER fpath[PATH_SIZE];
+
+    int result;
+
+    if (entry_count == 0)
+        return;
+
+    /*
+     * Protect the special directory entries.
+     */
+
+    if (!strcmp(entries[selected].name, "."))
+        return;
+
+    if (!strcmp(entries[selected].name, ".."))
+        return;
+
+    if (!confirm_delete())
+        return;
+
+    make_path(
+        entries[selected].name,
+        path
+    );
+
+    ascii_to_font(
+        path,
+        fpath
+    );
+
+    if (entries[selected].type ==
+        TYPE_DIRECTORY)
+    {
+        result =
+            Bfile_DeleteDirectory(
+                fpath
+            );
+    }
+    else
+    {
+        result =
+            Bfile_DeleteFile(
+                fpath
+            );
+    }
+
+    if (result < 0)
+        message(
+            "ERROR",
+            "DELETE FAILED"
+        );
+    else
+        message(
+            "G1FM",
+            "DELETE COMPLETE"
+        );
+
+    load_directory();
+}
+
+/* -------------------------------------------------- */
+/* Enter directory                                   */
+/* -------------------------------------------------- */
+
+static void enter_directory(void)
+{
+    FM_ENTRY *e;
+
+    if (entry_count == 0)
+        return;
+
+    e = &entries[selected];
+
+    if (e->type != TYPE_DIRECTORY)
+        return;
+
+    if (!strcmp(e->name, "."))
+        return;
+
+    if (!strcmp(e->name, ".."))
+    {
+        int i;
+
+        i = strlen(current_path) - 1;
+
+        while (i > 5 &&
+               current_path[i] != '\\')
+        {
+            i--;
+        }
+
+        if (i > 5)
+            current_path[i] = 0;
+
+        load_directory();
+
+        return;
+    }
+
+    if (strlen(current_path) +
+        strlen(e->name) + 2 >=
+        PATH_SIZE)
+    {
+        message(
+            "ERROR",
+            "PATH TOO LONG"
+        );
+
+        return;
+    }
+
+    strcat(
+        current_path,
+        "\\"
+    );
+
+    strcat(
+        current_path,
+        e->name
+    );
+
+    load_directory();
+}
+
+/* -------------------------------------------------- */
+/* Create directory                                   */
+/* -------------------------------------------------- */
+
+static void create_directory(void)
+{
+    char path[PATH_SIZE];
+
+    FONTCHARACTER fpath[PATH_SIZE];
+
+    /*
+     * The old SDK doesn't give us a nice modern
+     * text-entry control.
+     *
+     * This first version therefore uses a fixed
+     * directory name.
+     *
+     * Replace this with the filename editor below
+     * when you want arbitrary names.
+     */
+
+    strcpy(
+        path,
+        current_path
+    );
+
+    strcat(
+        path,
+        "\\NEWDIR"
+    );
+
+    ascii_to_font(
+        path,
+        fpath
+    );
+
+    if (Bfile_CreateDirectory(fpath) < 0)
+    {
+        message(
+            "CREATE DIRECTORY",
+            "FAILED"
+        );
+    }
+    else
+    {
+        message(
+            "CREATE DIRECTORY",
+            "CREATED NEWDIR"
+        );
+    }
+
+    load_directory();
+}
+
+/* -------------------------------------------------- */
+/* Text viewer                                        */
+/* -------------------------------------------------- */
+
+static void view_file(void)
+{
+    FM_ENTRY *e;
+
+    char path[PATH_SIZE];
+
+    FONTCHARACTER fpath[PATH_SIZE];
+
+    char buffer[256];
+    char line[22];
+
+    int handle;
+    int size;
+    int offset;
+
+    int bytes;
+    int i;
+    int p;
+    int line_number;
+
+    unsigned int key;
+
+    if (entry_count == 0)
+        return;
+
+    e = &entries[selected];
+
+    if (e->type == TYPE_DIRECTORY)
+        return;
+
+    make_path(
+        e->name,
+        path
+    );
+
+    ascii_to_font(
+        path,
+        fpath
+    );
+
+    handle =
+        Bfile_OpenFile(
+            fpath,
+            _OPENMODE_READ
+        );
+
+    if (handle < 0)
+    {
+        message(
+            "ERROR",
+            "CANNOT OPEN FILE"
+        );
+
+        return;
+    }
+
+    size =
+        Bfile_GetFileSize(handle);
+
+    offset = 0;
+
+    while (1)
+    {
+        clear_screen();
+
+        PrintXY(
+            1,
+            1,
+            e->name,
+            0
+        );
+
+        Bdisp_DrawLineVRAM(
+            0,
+            9,
+            127,
+            9
+        );
+
+        Bfile_SeekFile(
+            handle,
+            offset
+        );
+
+        bytes =
+            Bfile_ReadFile(
+                handle,
+                buffer,
+                240,
+                -1
+            );
+
+        if (bytes < 0)
+            bytes = 0;
+
+        /*
+         * Convert control characters.
+         */
+
+        for (i = 0; i < bytes; i++)
+        {
+            if ((unsigned char)buffer[i] < 32 &&
+                buffer[i] != '\n')
+            {
+                buffer[i] = '.';
+            }
+        }
+
+        /*
+         * Display approximately five lines.
+         */
+
+        p = 0;
+        line_number = 0;
+
+        while (p < bytes &&
+               line_number < 5)
+        {
+            i = 0;
+
+            while (p < bytes &&
+                   buffer[p] != '\n' &&
+                   i < 21)
+            {
+                line[i] = buffer[p];
+                i++;
+                p++;
+            }
+
+            line[i] = 0;
+
+            PrintXY(
+                1,
+                12 + line_number * 8,
+                line,
+                0
+            );
+
+            if (p < bytes &&
+                buffer[p] == '\n')
+            {
+                p++;
+            }
+
+            line_number++;
+        }
+
+        PrintXY(
+            1,
+            55,
+            "UP/DN Scroll EXIT Back",
+            0
+        );
+
+        Bdisp_PutDisp_DD();
+
+        GetKey(&key);
+
+        if (key == KEY_CTRL_EXIT)
+            break;
+
+        if (key == KEY_CTRL_DOWN)
+        {
+            offset += 100;
+
+            if (offset >= size)
+            {
+                if (size > 0)
+                    offset = size - 1;
+                else
+                    offset = 0;
+            }
+        }
+
+        if (key == KEY_CTRL_UP)
+        {
+            offset -= 100;
+
+            if (offset < 0)
+                offset = 0;
+        }
+    }
+
+    Bfile_CloseFile(handle);
+}
+
+/* -------------------------------------------------- */
+/* Open selected item                                */
+/* -------------------------------------------------- */
+
+static void open_selected(void)
+{
+    if (entry_count == 0)
+        return;
+
+    if (entries[selected].type ==
+        TYPE_DIRECTORY)
+    {
+        enter_directory();
+    }
+    else
+    {
+        view_file();
+    }
+}
+
+/* -------------------------------------------------- */
+/* Storage information                                */
+/* -------------------------------------------------- */
+
+static void storage_info(void)
+{
+    int free_bytes;
+
+    free_bytes = 0;
+
+    if (Bfile_GetMediaFree(
+            DEVICE_STORAGE,
+            &free_bytes) < 0)
+    {
+        message(
+            "STORAGE",
+            "ERROR"
+        );
+
+        return;
+    }
+
+    clear_screen();
+
+    PrintXY(
+        1,
+        1,
+        "INTERNAL STORAGE",
+        0
+    );
+
+    PrintXY(
+        1,
+        20,
+        "FREE:",
+        0
+    );
+
+    PrintMini(
+        38,
+        20,
+        free_bytes
+    );
+
+    PrintXY(
+        72,
+        20,
+        "BYTES",
+        0
+    );
+
+    PrintXY(
+        1,
+        38,
+        "NO SD CARD USED",
+        0
+    );
+
+    PrintXY(
+        1,
+        55,
+        "EXE / EXIT",
+        0
+    );
+
+    Bdisp_PutDisp_DD();
+
+    wait_key();
+}
+
+/* -------------------------------------------------- */
+/* Main browser                                       */
+/* -------------------------------------------------- */
+
+static void file_manager(void)
+{
+    unsigned int key;
+
+    load_directory();
+
+    while (1)
+    {
+        draw_browser();
+
+        GetKey(&key);
+
+        if (key == KEY_CTRL_UP)
+        {
+            move_up();
+        }
+
+        else if (key == KEY_CTRL_DOWN)
+        {
+            move_down();
+        }
+
+        else if (key == KEY_CTRL_EXE)
+        {
+            open_selected();
+        }
+
+        else if (key == KEY_CTRL_F1)
+        {
+            show_info();
+        }
+
+        else if (key == KEY_CTRL_F2)
+        {
+            delete_selected();
+        }
+
+        else if (key == KEY_CTRL_ALPHA)
+        {
+            create_directory();
+        }
+
+        else if (key == KEY_CTRL_MENU)
+        {
+            storage_info();
+        }
+
+        else if (key == KEY_CTRL_EXIT)
+        {
+            /*
+             * At root: exit application.
+             *
+             * Otherwise: go to parent.
+             */
+
+            if (!strcmp(
+                    current_path,
+                    "\\\\fls0"))
+            {
+                break;
+            }
+            else
+            {
+                int i;
+
+                i =
+                    strlen(current_path) - 1;
+
+                while (i > 5 &&
+                       current_path[i] != '\\')
+                {
+                    i--;
+                }
+
+                if (i > 5)
+                    current_path[i] = 0;
+
+                load_directory();
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------- */
+/* Add-in entry point                                 */
+/* -------------------------------------------------- */
+
+int AddIn_main(
+    int isAppli,
+    unsigned short OptionNum
+)
+{
+    file_manager();
+
+    Bdisp_AllClr_DDVRAM();
+
+    return 1;
+}
+
+/* -------------------------------------------------- */
+/* System initialization                              */
+/* -------------------------------------------------- */
+
+#pragma section _BR_Size
+
+unsigned long BR_Size;
+
+#pragma section
+
+#pragma section _TOP
+
+int InitializeSystem(
+    int isAppli,
+    unsigned short OptionNum
+)
+{
+    return INIT_ADDIN_APPLICATION(
+        isAppli,
+        OptionNum
+    );
+}
+
+#pragma section
